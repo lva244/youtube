@@ -1,4 +1,4 @@
-module github.com/kkdai/youtube/v2
+module github.com/lva244/youtube
 
 go 1.19
 
