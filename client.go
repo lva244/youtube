@@ -7,18 +7,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
-	"sync"
+	"sync/atomic"
+
+	"log/slog"
 )
 
 const (
 	Size1Kb  = 1024
 	Size1Mb  = Size1Kb * 1024
 	Size10Mb = Size1Mb * 10
+
+	playerParams = "CgIQBg=="
 )
 
 var (
@@ -30,9 +33,6 @@ var DefaultClient = WebClient
 
 // Client offers methods to download video metadata and video streams.
 type Client struct {
-	// Debug enables debugging output through log package
-	Debug bool
-
 	// HTTPClient can be used to set a custom HTTP client.
 	// If not set, http.DefaultClient will be used
 	HTTPClient *http.Client
@@ -174,7 +174,7 @@ var (
 	// WebClient, better to use Android client but go ahead.
 	WebClient = clientInfo{
 		name:      "WEB",
-		version:   "2.20210617.01.00",
+		version:   "2.20220801.00.00",
 		key:       "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
 		userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 	}
@@ -203,7 +203,7 @@ func (c *Client) videoDataByInnertube(ctx context.Context, id string) ([]byte, e
 		Context:        prepareInnertubeContext(*c.client),
 		ContentCheckOK: true,
 		RacyCheckOk:    true,
-		Params:         "8AEB",
+		Params:         playerParams,
 		PlaybackContext: &playbackContext{
 			ContentPlaybackContext: contentPlaybackContext{
 				// SignatureTimestamp: sts,
@@ -215,10 +215,10 @@ func (c *Client) videoDataByInnertube(ctx context.Context, id string) ([]byte, e
 	return c.httpPostBodyBytes(ctx, "https://www.youtube.com/youtubei/v1/player?key="+c.client.key, data)
 }
 
-func (c *Client) transcriptDataByInnertube(ctx context.Context, id string) ([]byte, error) {
+func (c *Client) transcriptDataByInnertube(ctx context.Context, id string, lang string) ([]byte, error) {
 	data := innertubeRequest{
 		Context: prepareInnertubeContext(*c.client),
-		Params:  transcriptVideoID(id),
+		Params:  transcriptVideoID(id, lang),
 	}
 
 	return c.httpPostBodyBytes(ctx, "https://www.youtube.com/youtubei/v1/get_transcript?key="+c.client.key, data)
@@ -247,7 +247,7 @@ func prepareInnertubePlaylistData(ID string, continuation bool, clientInfo clien
 			Continuation:   ID,
 			ContentCheckOK: true,
 			RacyCheckOk:    true,
-			Params:         "8AEB",
+			Params:         playerParams,
 		}
 	}
 
@@ -256,13 +256,13 @@ func prepareInnertubePlaylistData(ID string, continuation bool, clientInfo clien
 		BrowseID:       "VL" + ID,
 		ContentCheckOK: true,
 		RacyCheckOk:    true,
-		Params:         "8AEB",
+		Params:         playerParams,
 	}
 }
 
 // transcriptVideoID encodes the video ID to the param used to fetch transcripts.
-func transcriptVideoID(videoID string) string {
-	langCode := encTranscriptLang("en")
+func transcriptVideoID(videoID string, lang string) string {
+	langCode := encTranscriptLang(lang)
 
 	// This can be optionally appened to the Sprintf str, not sure what it means
 	// *3engagement-panel-searchable-transcript-search-panel\x30\x00\x38\x01\x40\x01
@@ -335,19 +335,7 @@ func (c *Client) GetStreamContext(ctx context.Context, video *Video, format *For
 		contentLength = c.downloadOnce(req, w, format)
 	} else {
 		// we have length information, let's download by chunks!
-		data, err := c.downloadChunked(ctx, req, format)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		go func() {
-			if _, err := w.Write(data); err != nil {
-				w.CloseWithError(err)
-				return
-			}
-
-			w.Close() //nolint:errcheck
-		}()
+		c.downloadChunked(ctx, req, w, format)
 	}
 
 	return r, contentLength, nil
@@ -376,11 +364,6 @@ func (c *Client) downloadOnce(req *http.Request, w *io.PipeWriter, _ *Format) in
 	return length
 }
 
-type chunkData struct {
-	index int
-	data  []byte
-}
-
 func (c *Client) getChunkSize() int64 {
 	if c.ChunkSize > 0 {
 		return c.ChunkSize
@@ -403,71 +386,57 @@ func (c *Client) getMaxRoutines(limit int) int {
 	return routines
 }
 
-func (c *Client) downloadChunked(ctx context.Context, req *http.Request, format *Format) ([]byte, error) {
+func (c *Client) downloadChunked(ctx context.Context, req *http.Request, w *io.PipeWriter, format *Format) {
 	chunks := getChunks(format.ContentLength, c.getChunkSize())
 	maxRoutines := c.getMaxRoutines(len(chunks))
 
-	chunkChan := make(chan chunk, len(chunks))
-	chunkDataChan := make(chan chunkData, len(chunks))
-	errChan := make(chan error, 1)
-
-	for _, c := range chunks {
-		chunkChan <- c
+	cancelCtx, cancel := context.WithCancel(ctx)
+	abort := func(err error) {
+		w.CloseWithError(err)
+		cancel()
 	}
-	close(chunkChan)
 
-	var wg sync.WaitGroup
-
+	currentChunk := atomic.Uint32{}
 	for i := 0; i < maxRoutines; i++ {
-		wg.Add(1)
-
 		go func() {
-			defer wg.Done()
-
 			for {
-				select {
-				case <-ctx.Done():
-					errChan <- context.DeadlineExceeded
+				chunkIndex := int(currentChunk.Add(1)) - 1
+				if chunkIndex >= len(chunks) {
+					// no more chunks
 					return
-				case ch, open := <-chunkChan:
-					if !open {
-						return
-					}
+				}
 
-					data, err := c.downloadChunk(req.Clone(ctx), ch)
-					if err != nil {
-						errChan <- err
-						return
-					}
+				chunk := &chunks[chunkIndex]
+				err := c.downloadChunk(req.Clone(cancelCtx), chunk)
+				close(chunk.data)
 
-					chunkDataChan <- chunkData{ch.index, data}
+				if err != nil {
+					abort(err)
+					return
 				}
 			}
 		}()
 	}
-	wg.Wait()
 
-	close(errChan)
-	close(chunkDataChan)
+	go func() {
+		// copy chunks into the PipeWriter
+		for i := 0; i < len(chunks); i++ {
+			select {
+			case <-cancelCtx.Done():
+				abort(context.Canceled)
+				return
+			case data := <-chunks[i].data:
+				_, err := io.Copy(w, bytes.NewBuffer(data))
 
-	for err := range errChan {
-		if err != nil {
-			return nil, err
+				if err != nil {
+					abort(err)
+				}
+			}
 		}
-	}
 
-	chunkDatas := make([]chunkData, len(chunks))
-
-	for cd := range chunkDataChan {
-		chunkDatas[cd.index] = cd
-	}
-
-	data := make([]byte, 0, format.ContentLength)
-	for _, chunk := range chunkDatas {
-		data = append(data, chunk.data...)
-	}
-
-	return data, nil
+		// everything succeeded
+		w.Close()
+	}()
 }
 
 // GetStreamURL returns the url for a specific format
@@ -513,10 +482,6 @@ func (c *Client) httpDo(req *http.Request) (*http.Response, error) {
 		client = http.DefaultClient
 	}
 
-	if c.Debug {
-		log.Println(req.Method, req.URL)
-	}
-
 	req.Header.Set("User-Agent", c.client.userAgent)
 	req.Header.Set("Origin", "https://youtube.com")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
@@ -534,8 +499,12 @@ func (c *Client) httpDo(req *http.Request) (*http.Response, error) {
 
 	res, err := client.Do(req)
 
-	if c.Debug && res != nil {
-		log.Println(res.Status)
+	log := slog.With("method", req.Method, "url", req.URL)
+
+	if err != nil {
+		log.Debug("HTTP request failed", "error", err)
+	} else {
+		log.Debug("HTTP request succeeded", "status", res.Status)
 	}
 
 	return res, err
@@ -613,28 +582,37 @@ func (c *Client) httpPostBodyBytes(ctx context.Context, url string, body interfa
 	return io.ReadAll(resp.Body)
 }
 
-// downloadChunk returns the chunk bytes.
+// downloadChunk writes the response data into the data channel of the chunk.
 // Downloading in multiple chunks is much faster:
 // https://github.com/kkdai/youtube/pull/190
-func (c *Client) downloadChunk(req *http.Request, chunk chunk) ([]byte, error) {
+func (c *Client) downloadChunk(req *http.Request, chunk *chunk) error {
 	q := req.URL.Query()
 	q.Set("range", fmt.Sprintf("%d-%d", chunk.start, chunk.end))
 	req.URL.RawQuery = q.Encode()
 
 	resp, err := c.httpDo(req)
 	if err != nil {
-		return nil, ErrUnexpectedStatusCode(resp.StatusCode)
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK && resp.StatusCode >= 300 {
-		return nil, ErrUnexpectedStatusCode(resp.StatusCode)
+		return ErrUnexpectedStatusCode(resp.StatusCode)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	expected := int(chunk.end-chunk.start) + 1
+	data, err := io.ReadAll(resp.Body)
+	n := len(data)
+
 	if err != nil {
-		return nil, fmt.Errorf("read chunk body: %w", err)
+		return err
 	}
 
-	return b, nil
+	if n != expected {
+		return fmt.Errorf("chunk at offset %d has invalid size: expected=%d actual=%d", chunk.start, expected, n)
+	}
+
+	chunk.data <- data
+
+	return nil
 }
